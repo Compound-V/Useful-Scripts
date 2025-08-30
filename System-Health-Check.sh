@@ -1,26 +1,30 @@
 #!/bin/bash
 
-# Enhanced Universal System Health Check v5.0
+# Enhanced Universal System Health Check v5.1
 # Comprehensive Hardware & Software Diagnostics with Root Cause Analysis
 # Compatible with Debian-based systems
 
 # Color definitions with fallback
-
-if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ $(tput colors 2>/dev/null) -ge 8 ]]; then
-    readonly RED='\033[0;31m'
-    readonly GREEN='\033[0;32m' 
-    readonly YELLOW='\033[1;33m'
-    readonly BLUE='\033[0;34m'
-    readonly CYAN='\033[0;36m'
-    readonly PURPLE='\033[0;35m'
-    readonly BOLD='\033[1m'
-    readonly DIM='\033[2m'
-    readonly NC='\033[0m'
-    readonly CHECK="✓"
-    readonly CROSS="✗"
-    readonly WARN="⚠"
-    readonly INFO="ℹ"
-    readonly FIX="🔧"
+if [[ -t 1 ]] && { [[ -n "$TERM" ]] && [[ "$TERM" != "dumb" ]]; } && command -v tput >/dev/null 2>&1; then
+    if tput colors >/dev/null 2>&1 && [[ $(tput colors 2>/dev/null) -ge 8 ]]; then
+        readonly RED='\033[0;31m'
+        readonly GREEN='\033[0;32m' 
+        readonly YELLOW='\033[1;33m'
+        readonly BLUE='\033[0;34m'
+        readonly CYAN='\033[0;36m'
+        readonly PURPLE='\033[0;35m'
+        readonly BOLD='\033[1m'
+        readonly DIM='\033[2m'
+        readonly NC='\033[0m'
+        readonly CHECK="✓"
+        readonly CROSS="✗"
+        readonly WARN="⚠"
+        readonly INFO="ℹ"
+        readonly FIX="🔧"
+    else
+        readonly RED='' GREEN='' YELLOW='' BLUE='' CYAN='' PURPLE='' BOLD='' DIM='' NC=''
+        readonly CHECK="[OK]" CROSS="[FAIL]" WARN="[WARN]" INFO="[INFO]" FIX="[FIX]"
+    fi
 else
     readonly RED='' GREEN='' YELLOW='' BLUE='' CYAN='' PURPLE='' BOLD='' DIM='' NC=''
     readonly CHECK="[OK]" CROSS="[FAIL]" WARN="[WARN]" INFO="[INFO]" FIX="[FIX]"
@@ -29,7 +33,7 @@ fi
 # Global tracking variables
 declare -i TOTAL_TESTS=0 PASSED_TESTS=0 FAILED_TESTS=0 WARNING_TESTS=0 SKIPPED_TESTS=0
 declare -a CRITICAL_ISSUES=() HIGH_ISSUES=() MEDIUM_ISSUES=() INFO_ITEMS=() DETAILED_ERRORS=()
-declare -A TEST_RESULTS=() FIX_SUGGESTIONS=() HARDWARE_INFO=()
+declare -A TEST_RESULTS=() FIX_SUGGESTIONS=() HARDWARE_INFO=() HARDWARE_CACHE=()
 readonly START_TIME=$(date +%s)
 
 # Hardware database for driver recommendations
@@ -38,6 +42,7 @@ declare -A HARDWARE_DRIVERS=(
     ["8087:0025"]="firmware-iwlwifi bluez-firmware"
     ["8087:0026"]="firmware-iwlwifi bluez-firmware"  
     ["8087:0029"]="firmware-iwlwifi bluez-firmware"
+    ["8087:0a2b"]="bluez-firmware"  # Intel Bluetooth found in your system
     ["04ca:3015"]="firmware-brcm80211"
     ["0cf3:e007"]="firmware-atheros"
     ["13d3:3491"]="firmware-atheros"
@@ -45,6 +50,7 @@ declare -A HARDWARE_DRIVERS=(
     # WiFi hardware
     ["8086:24f3"]="firmware-iwlwifi"
     ["8086:095a"]="firmware-iwlwifi"
+    ["8086:24fd"]="firmware-iwlwifi"  # Intel Wireless 8265/8275
     ["10ec:b822"]="firmware-realtek"
     ["10ec:c821"]="firmware-realtek"
     ["14e4:43a0"]="firmware-brcm80211"
@@ -60,6 +66,7 @@ declare -A HARDWARE_DRIVERS=(
     ["8086:9bca"]="firmware-misc-nonfree"
     ["1002:15dd"]="firmware-amd-graphics"
     ["10de:1c03"]="nvidia-driver firmware-misc-nonfree"
+    ["10de:174d"]="nvidia-driver-535"  # NVIDIA GM108M [GeForce MX130]
     
     # Touchpad/Input
     ["04f3:0c4b"]="xserver-xorg-input-synaptics"
@@ -78,8 +85,10 @@ declare -A ERROR_PATTERNS=(
     ["hci.*timeout"]="bluetooth_hci_timeout"
     ["snd_hda_intel.*spurious response"]="audio_spurious_response"
     ["i2c_hid_acpi.*incorrect report"]="touchpad_hid_error"
+    ["i2c_hid.*ELAN.*incorrect report"]="elan_touchpad_error"
     ["iwlwifi.*firmware.*failed"]="wifi_firmware_failed"
     ["i915.*GPU.*hung"]="gpu_hang"
+    ["nouveau.*MMIO.*FAULT"]="nvidia_gpu_error"
     ["ata.*failed command"]="storage_ata_error"
     ["usb.*device descriptor read.*error"]="usb_device_error"
     ["thermal.*throttling"]="thermal_throttling"
@@ -112,6 +121,27 @@ safe_calc() { awk "BEGIN {printf \"%.1f\", $1}" 2>/dev/null || echo "0"; }
 sanitize_output() {
     echo "$1" | tr -d '[:space:]' | grep -oE '[0-9]*'
 }
+
+sanitize_integer() {
+    echo "$1" | tr -d '[:space:]' | grep -oE '^[0-9]+$' || echo "0"
+}
+
+safe_arithmetic() {
+    local value1=$(sanitize_integer "$1")
+    local value2=$(sanitize_integer "$2")
+    local operation="$3"
+    
+    case "$operation" in
+        "gt") [[ "$value1" -gt "$value2" ]] && return 0 || return 1 ;;
+        "eq") [[ "$value1" -eq "$value2" ]] && return 0 || return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
+sanitize_path() {
+    echo "$1" | sed 's/[^a-zA-Z0-9/_.-]//g'
+}
+
 log_result() {
     local status="$1" category="$2" test_name="$3" message="$4" priority="${5:-medium}" details="${6:-}"
     
@@ -182,7 +212,7 @@ print_main_header() {
     
     echo
     printf "${BOLD}${PURPLE}╭─────────────────────────────────────────────────────────╮${NC}\n"
-    printf "${BOLD}${PURPLE}│${NC}         ${BOLD}COMPREHENSIVE SYSTEM HEALTH CHECK v5.0${NC}          ${BOLD}${PURPLE}│${NC}\n"
+    printf "${BOLD}${PURPLE}│${NC}         ${BOLD}COMPREHENSIVE SYSTEM HEALTH CHECK v5.1${NC}          ${BOLD}${PURPLE}│${NC}\n"
     printf "${BOLD}${PURPLE}╰─────────────────────────────────────────────────────────╯${NC}\n"
     echo
     printf "${BOLD}System Information:${NC}\n"
@@ -245,6 +275,14 @@ detect_hardware() {
     echo "$hw_info"
 }
 
+detect_hardware_cached() {
+    local hw_type="$1"
+    if [[ -z "${HARDWARE_CACHE[$hw_type]}" ]]; then
+        HARDWARE_CACHE["$hw_type"]=$(detect_hardware "$hw_type")
+    fi
+    echo "${HARDWARE_CACHE[$hw_type]}"
+}
+
 get_hardware_ids() {
     local hw_type="$1"
     local ids=""
@@ -252,7 +290,17 @@ get_hardware_ids() {
     case "$hw_type" in
         "bluetooth"|"wifi"|"audio"|"gpu")
             if command_exists lspci; then
-                ids=$(lspci -nn 2>/dev/null | grep -iE "$hw_type" | grep -oE '\[[0-9a-f]{4}:[0-9a-f]{4}\]' | tr -d '[]' | head -3)
+                case "$hw_type" in
+                    "bluetooth")
+                        ids=$(lspci -nn 2>/dev/null | grep -iE "(bluetooth|wireless.*bt)" | grep -oE '\[[0-9a-f]{4}:[0-9a-f]{4}\]' | tr -d '[]' | head -3)
+                        ;;
+                    "wifi")
+                        ids=$(lspci -nn 2>/dev/null | grep -iE "(wireless|802\.11|wifi)" | grep -oE '\[[0-9a-f]{4}:[0-9a-f]{4}\]' | tr -d '[]' | head -3)
+                        ;;
+                    *)
+                        ids=$(lspci -nn 2>/dev/null | grep -iE "$hw_type" | grep -oE '\[[0-9a-f]{4}:[0-9a-f]{4}\]' | tr -d '[]' | head -3)
+                        ;;
+                esac
             fi
             if [[ -z "$ids" ]] && command_exists lsusb; then
                 ids=$(lsusb 2>/dev/null | grep -iE "$hw_type" | grep -oE '[0-9a-f]{4}:[0-9a-f]{4}' | head -3)
@@ -267,16 +315,28 @@ analyze_error_pattern() {
     local error_text="$1"
     local category="$2"
     local fixes=""
+    local hardware_context=""
+    
+    # Get additional hardware context
+    case "$category" in
+        "bluetooth")
+            hardware_context=$(lspci -v 2>/dev/null | grep -A5 -i bluetooth || lsusb -v 2>/dev/null | grep -A5 -i bluetooth)
+            ;;
+        "gpu")
+            hardware_context=$(lspci -v 2>/dev/null | grep -A10 -i vga || lspci -v 2>/dev/null | grep -A10 -i nvidia)
+            ;;
+    esac
     
     for pattern in "${!ERROR_PATTERNS[@]}"; do
         if echo "$error_text" | grep -qE "$pattern"; then
             case "${ERROR_PATTERNS[$pattern]}" in
                 "bluetooth_features_failed")
                     local bt_hw bt_ids
-                    bt_hw=$(detect_hardware "bluetooth")
+                    bt_hw=$(detect_hardware_cached "bluetooth")
                     bt_ids=$(get_hardware_ids "bluetooth")
                     fixes="Root Cause: Bluetooth controller firmware/driver issue"$'\n'
                     fixes+="Hardware Detected: $bt_hw"$'\n'
+                    fixes+="Hardware Context: $hardware_context"$'\n'
                     fixes+="Recommended Fixes:"$'\n'
                     fixes+="1. Update Bluetooth firmware: sudo apt install bluez-firmware"$'\n'
                     fixes+="2. Reset Bluetooth: sudo systemctl restart bluetooth"$'\n'
@@ -292,9 +352,9 @@ analyze_error_pattern() {
                     fixes+="5. Add kernel parameter: btusb.enable_autosuspend=0 to GRUB"
                     ;;
                     
-                "touchpad_hid_error")
+                "touchpad_hid_error"|"elan_touchpad_error")
                     local tp_hw
-                    tp_hw=$(detect_hardware "touchpad")
+                    tp_hw=$(detect_hardware_cached "touchpad")
                     fixes="Root Cause: I2C HID touchpad communication error"$'\n'
                     fixes+="Hardware: $tp_hw"$'\n'
                     fixes+="Recommended Fixes:"$'\n'
@@ -306,7 +366,7 @@ analyze_error_pattern() {
                     
                 "audio_spurious_response")
                     local audio_hw
-                    audio_hw=$(detect_hardware "audio")
+                    audio_hw=$(detect_hardware_cached "audio")
                     fixes="Root Cause: Audio codec communication timeout/error"$'\n'
                     fixes+="Hardware: $audio_hw"$'\n'
                     fixes+="Recommended Fixes:"$'\n'
@@ -318,7 +378,7 @@ analyze_error_pattern() {
                     
                 "wifi_firmware_failed")
                     local wifi_hw wifi_ids
-                    wifi_hw=$(detect_hardware "wifi")
+                    wifi_hw=$(detect_hardware_cached "wifi")
                     wifi_ids=$(get_hardware_ids "wifi")
                     fixes="Root Cause: WiFi firmware missing or incompatible"$'\n'
                     fixes+="Hardware Detected: $wifi_hw"$'\n'
@@ -336,9 +396,19 @@ analyze_error_pattern() {
                     fixes+="4. Check: dmesg | grep -i firmware for specific errors"
                     ;;
                     
+                "nvidia_gpu_error")
+                    fixes="Root Cause: NVIDIA GPU driver conflict with nouveau"$'\n'
+                    fixes+="Hardware Context: $hardware_context"$'\n'
+                    fixes+="Recommended Fixes:"$'\n'
+                    fixes+="1. Install proprietary NVIDIA driver: sudo apt install nvidia-driver-535"$'\n'
+                    fixes+="2. Blacklist nouveau driver: echo 'blacklist nouveau' | sudo tee /etc/modprobe.d/blacklist-nouveau.conf"$'\n'
+                    fixes+="3. Update initramfs: sudo update-initramfs -u"$'\n'
+                    fixes+="4. Reboot system: sudo reboot"
+                    ;;
+                    
                 "storage_ata_error")
                     local storage_hw
-                    storage_hw=$(detect_hardware "storage")
+                    storage_hw=$(detect_hardware_cached "storage")
                     fixes="Root Cause: Storage device communication error"$'\n'
                     fixes+="Hardware: $storage_hw"$'\n'
                     fixes+="Recommended Fixes:"$'\n'
@@ -401,8 +471,9 @@ run_boot_hardware_tests() {
         fi
         
         boot_errors=$(echo "$error_details" | wc -l)
+        boot_errors=$(sanitize_integer "$boot_errors")
         
-        if [[ ${boot_errors:-0} -eq 0 ]]; then
+        if safe_arithmetic "$boot_errors" "0" "eq"; then
             log_result "PASS" "Hardware" "$test_name" "No critical boot errors detected"
             print_test_result "PASS" "$test_name" "Clean boot sequence"
         else
@@ -426,6 +497,11 @@ run_boot_hardware_tests() {
             if echo "$error_details" | grep -qiE "iwlwifi.*firmware"; then
                 fix_recommendations+="WiFi firmware issues detected. "
                 FIX_SUGGESTIONS["wifi_fix"]=$(analyze_error_pattern "$error_details" "wifi")
+            fi
+            
+            if echo "$error_details" | grep -qiE "nouveau.*MMIO.*FAULT"; then
+                fix_recommendations+="NVIDIA GPU driver issue detected. "
+                FIX_SUGGESTIONS["nvidia_fix"]=$(analyze_error_pattern "$error_details" "gpu")
             fi
             
             log_result "FAIL" "Hardware" "$test_name" "$boot_errors hardware errors with driver issues" "high" "$error_details"
@@ -455,7 +531,7 @@ run_boot_hardware_tests() {
         local hw_types=("wifi" "bluetooth" "audio" "gpu" "storage")
         for hw_type in "${hw_types[@]}"; do
             local hw_info
-            hw_info=$(detect_hardware "$hw_type")
+            hw_info=$(detect_hardware_cached "$hw_type")
             if [[ -n "$hw_info" ]]; then
                 printf "    ${CYAN}%s:${NC}\n" "${hw_type^}"
                 echo "$hw_info" | while read -r line; do
@@ -486,7 +562,10 @@ run_boot_hardware_tests() {
         mem_total=$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
         mem_available=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
         
-        if [[ -n "$mem_total" && -n "$mem_available" ]]; then
+        mem_total=$(sanitize_integer "$mem_total")
+        mem_available=$(sanitize_integer "$mem_available")
+        
+        if [[ -n "$mem_total" && -n "$mem_available" && "$mem_total" -gt 0 ]]; then
             mem_used_percent=$(safe_calc "(($mem_total - $mem_available) / $mem_total) * 100")
             mem_total_gb=$(safe_calc "$mem_total / 1024 / 1024")
             
@@ -512,6 +591,8 @@ run_boot_hardware_tests() {
         load_1min=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
         cpu_cores=$(nproc 2>/dev/null || echo "1")
         
+        cpu_cores=$(sanitize_integer "$cpu_cores")
+        
         if [[ -n "$load_1min" ]]; then
             load_percent=$(safe_calc "($load_1min / $cpu_cores) * 100")
             local load_avg=$(awk '{print $1,$2,$3}' /proc/loadavg 2>/dev/null)
@@ -534,6 +615,8 @@ run_boot_hardware_tests() {
     if [[ -r /sys/class/thermal/thermal_zone0/temp ]]; then
         local temp_raw temp_celsius
         temp_raw=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
+        temp_raw=$(sanitize_integer "$temp_raw")
+        
         if [[ -n "$temp_raw" && "$temp_raw" -gt 0 ]]; then
             temp_celsius=$((temp_raw / 1000))
             
@@ -569,6 +652,8 @@ run_storage_tests() {
             mount_point=$(echo "$line" | awk '{print $6}')
             usage_percent=$(echo "$line" | awk '{print $5}' | tr -d '%')
             filesystem=$(echo "$line" | awk '{print $1}')
+            
+            usage_percent=$(sanitize_integer "$usage_percent")
             
             if [[ "$usage_percent" -gt 95 ]]; then
                 ((critical_mounts++))
@@ -614,6 +699,8 @@ run_storage_tests() {
     local test_name="Inode Usage"
     local inode_usage
     inode_usage=$(df -i / 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
+    inode_usage=$(sanitize_integer "$inode_usage")
+    
     if [[ -n "$inode_usage" ]]; then
         if [[ "$inode_usage" -gt 90 ]]; then
             FIX_SUGGESTIONS["inode_fix"]="Critical inode usage. 1) Delete unnecessary small files 2) Clear temporary files 3) Check for too many files in directories"
@@ -625,7 +712,7 @@ run_storage_tests() {
             print_test_result "WARN" "$test_name" "${inode_usage}% used (High)" "Monitor file creation" "inode_warn"
         else
             log_result "PASS" "Storage" "$test_name" "Inode usage: ${inode_usage}%" "info"
-            print_test_result "PASS" "$test_name" "${inode_usage}% used" "Adequate file descriptors"
+            print_test_result "PASS" "$test_name" "${inode_usage%} used" "Adequate file descriptors"
         fi
     fi
     
@@ -682,7 +769,7 @@ run_package_tests() {
     if command_exists apt-get; then
         local apt_check_output
         apt_check_output=$(sudo apt-get check 2>&1)
-        if [[ $? -eq 0 ]]; then
+        if [[ $? -eq 0 ]] || echo "$apt_check_output" | grep -q "0 broken"; then
             log_result "PASS" "Packages" "$test_name" "No broken packages detected"
             print_test_result "PASS" "$test_name" "All packages consistent"
         else
@@ -703,7 +790,7 @@ run_package_tests() {
     elif command_exists apt; then
         local apt_check_output
         apt_check_output=$(sudo apt check 2>&1)
-        if [[ $? -eq 0 ]]; then
+        if [[ $? -eq 0 ]] || echo "$apt_check_output" | grep -q "0 broken"; then
             log_result "PASS" "Packages" "$test_name" "No broken packages detected"
             print_test_result "PASS" "$test_name" "All packages consistent"
         else
@@ -730,18 +817,20 @@ run_package_tests() {
     if command_exists apt; then
         if [[ -d /var/lib/apt/lists ]] && [[ -n "$(ls -A /var/lib/apt/lists/ 2>/dev/null)" ]]; then
             local updates security_updates
-            updates=$(apt list --upgradable 2>/dev/null | grep -c "upgradable" || echo "0")
+            
+            # Count upgradable packages safely
+            updates=$(apt list --upgradable 2>/dev/null | grep -c "/.*upgradable" || echo "0")
             security_updates=$(apt list --upgradable 2>/dev/null | grep -ic "security" || echo "0")
             
-            # Fix the syntax error - ensure we're comparing integers
-            updates=${updates//[!0-9]/}  # Remove non-numeric characters
-            security_updates=${security_updates//[!0-9]/}  # Remove non-numeric characters
+            # Ensure variables are integers
+            updates=$(sanitize_integer "$updates")
+            security_updates=$(sanitize_integer "$security_updates")
             
-            if [[ "$updates" -eq 0 ]]; then
+            if safe_arithmetic "$updates" "0" "eq"; then
                 log_result "PASS" "Packages" "$test_name" "System is up to date"
                 print_test_result "PASS" "$test_name" "All packages current"
             else
-                if [[ "$security_updates" -gt 0 ]]; then
+                if safe_arithmetic "$security_updates" "0" "gt"; then
                     FIX_SUGGESTIONS["security_updates"]="Security updates available. Install with: sudo apt update && sudo apt upgrade --only-upgrade-security"
                     log_result "FAIL" "Packages" "$test_name" "$updates total updates ($security_updates security)" "high"
                     print_test_result "FAIL" "$test_name" "$updates updates available" "$security_updates are security updates" "security_updates"
@@ -785,11 +874,14 @@ run_package_tests() {
     if command_exists snap; then
         local snap_count snap_updates
         snap_count=$(snap list 2>/dev/null | tail -n +2 | wc -l || echo "0")
+        snap_count=$(sanitize_integer "$snap_count")
         
         if [[ "$snap_count" -gt 0 ]]; then
             if safe_timeout 15 snap refresh --list >/dev/null 2>&1; then
                 snap_updates=$(snap refresh --list 2>/dev/null | tail -n +2 | wc -l || echo "0")
-                if [[ "$snap_updates" -gt 0 ]]; then
+                snap_updates=$(sanitize_integer "$snap_updates")
+                
+                if safe_arithmetic "$snap_updates" "0" "gt"; then
                     FIX_SUGGESTIONS["snap_updates"]="Snap updates available. Update with: sudo snap refresh"
                     log_result "WARN" "Packages" "$test_name" "$snap_updates snap updates available"
                     print_test_result "WARN" "$test_name" "$snap_updates updates pending" "$snap_count total snaps" "snap_updates"
@@ -823,11 +915,13 @@ run_service_tests() {
     local test_name="Failed Services Analysis"
     if command_exists systemctl; then
         local failed_services_list failed_count
-        failed_services_list=$(systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null)
-        failed_count=$(echo "$failed_services_list" | grep -c ".service" 2>/dev/null | tr -d '[:space:]') 
-        [[ -z "$failed_count" ]] && failed_count=0
         
-        if [[ "$failed_count" -eq 0 ]]; then
+        # Better service counting with error handling
+        failed_services_list=$(systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null)
+        failed_count=$(echo "$failed_services_list" | grep -c ".service" 2>/dev/null)
+        failed_count=$(sanitize_integer "$failed_count")
+        
+        if safe_arithmetic "$failed_count" "0" "eq"; then
             log_result "PASS" "Services" "$test_name" "No failed services"
             print_test_result "PASS" "$test_name" "All services operational"
         else
@@ -928,8 +1022,9 @@ run_network_tests() {
         local interface_info active_interfaces
         interface_info=$(ip -brief addr show 2>/dev/null)
         active_interfaces=$(echo "$interface_info" | grep -c "UP" || echo "0")
+        active_interfaces=$(sanitize_integer "$active_interfaces")
         
-        if [[ "$active_interfaces" -gt 0 ]]; then
+        if safe_arithmetic "$active_interfaces" "0" "gt"; then
             echo "    ${BOLD}${BLUE}NETWORK INTERFACES:${NC}"
             echo "$interface_info" | grep -v "lo" | while read -r line; do
                 if [[ "$line" =~ UP ]]; then
@@ -997,7 +1092,7 @@ run_network_tests() {
         local dns_ok=false
         
         for domain in "${test_domains[@]}"; do
-            if safe_timeout 5 nslookup "$domain" >/dev/null 2>&1 || safe_timeout 5 dig "$domain" >/dev/null 2>&1; then
+            if safe_timeout 5 bash -c "nslookup '$domain' >/dev/null 2>&1 || dig '$domain' >/dev/null 2>&1"; then
                 log_result "PASS" "Network" "$test_name" "DNS resolution working for $domain" "info"
                 print_test_result "PASS" "$test_name" "DNS operational" "Resolved: $domain"
                 dns_ok=true
@@ -1028,6 +1123,7 @@ run_security_tests() {
         if [[ "$ufw_status" = "active" ]]; then
             local rule_count
             rule_count=$(ufw status numbered 2>/dev/null | grep -c "\[" | tr -d '[:space:]') 
+            rule_count=$(sanitize_integer "$rule_count")
             [[ -z "$rule_count" ]] && rule_count=0
             log_result "PASS" "Security" "$test_name" "UFW active with $rule_count rules"
             print_test_result "PASS" "$test_name" "UFW firewall active" "$rule_count rules configured"
@@ -1039,7 +1135,8 @@ run_security_tests() {
     elif command_exists iptables && is_root; then
         local rule_count
         rule_count=$(iptables -L 2>/dev/null | grep -c "^Chain" || echo "0")
-        if [[ "$rule_count" -gt 3 ]]; then
+        rule_count=$(sanitize_integer "$rule_count")
+        if safe_arithmetic "$rule_count" "3" "gt"; then
             log_result "PASS" "Security" "$test_name" "iptables rules configured"
             print_test_result "PASS" "$test_name" "iptables active" "Custom firewall rules"
         else
@@ -1060,12 +1157,13 @@ run_security_tests() {
         local auth_failures auth_time_window="2 hours ago"
         auth_failures=$(journalctl --since "$auth_time_window" --no-pager 2>/dev/null | 
                grep -icE "authentication failure|failed password|invalid user" | tr -d '[:space:]')
-               [[ -z "$auth_failures" ]] && auth_failures=0
+        auth_failures=$(sanitize_integer "$auth_failures")
+        [[ -z "$auth_failures" ]] && auth_failures=0
 
-        if [[ "$auth_failures" -eq 0 ]]; then
+        if safe_arithmetic "$auth_failures" "0" "eq"; then
             log_result "PASS" "Security" "$test_name" "No recent authentication failures"
             print_test_result "PASS" "$test_name" "No failed logins" "Clean authentication log"
-        elif [[ "$auth_failures" -le 5 ]]; then
+        elif safe_arithmetic "$auth_failures" "5" "le"; then
             log_result "WARN" "Security" "$test_name" "$auth_failures authentication failures in last 2 hours"
             print_test_result "WARN" "$test_name" "$auth_failures failed attempts" "Monitor authentication logs"
         else
@@ -1088,11 +1186,12 @@ run_security_tests() {
     if is_root && command_exists journalctl; then
         local recent_errors error_time_window="1 hour ago"
         recent_errors=$(journalctl -p 3 -b --since "$error_time_window" --no-pager 2>/dev/null | wc -l || echo "0")
+        recent_errors=$(sanitize_integer "$recent_errors")
         
-        if [[ "$recent_errors" -eq 0 ]]; then
+        if safe_arithmetic "$recent_errors" "0" "eq"; then
             log_result "PASS" "Security" "$test_name" "No recent critical errors"
             print_test_result "PASS" "$test_name" "Clean error logs" "No critical system errors"
-        elif [[ "$recent_errors" -le 3 ]]; then
+        elif safe_arithmetic "$recent_errors" "3" "le"; then
             log_result "WARN" "Security" "$test_name" "$recent_errors critical errors in last hour"
             print_test_result "WARN" "$test_name" "$recent_errors recent errors" "Check: journalctl -p 3 --since '1 hour ago'"
         else
@@ -1127,127 +1226,211 @@ run_security_tests() {
         log_result "PASS" "Security" "$test_name" "No reboot required"
         print_test_result "PASS" "$test_name" "System current" "No pending reboot needed"
     fi
-    
-    # System uptime analysis
+    }
+# System uptime analysis
+run_uptime_analysis() {
     local test_name="System Uptime"
     if [[ -r /proc/uptime ]]; then
-        local uptime_seconds uptime_days uptime_hours
+        local uptime_seconds uptime_days uptime_hours uptime_minutes
         uptime_seconds=$(cut -d' ' -f1 /proc/uptime | cut -d'.' -f1)
+        uptime_seconds=$(sanitize_integer "$uptime_seconds")
+        
+        # Calculate time components
         uptime_days=$((uptime_seconds / 86400))
         uptime_hours=$(( (uptime_seconds % 86400) / 3600 ))
+        uptime_minutes=$(( (uptime_seconds % 3600) / 60 ))
         
+        # Format uptime string based on duration
+        local uptime_display
+        if [[ "$uptime_days" -gt 0 ]]; then
+            uptime_display="${uptime_days}d ${uptime_hours}h ${uptime_minutes}m"
+        elif [[ "$uptime_hours" -gt 0 ]]; then
+            uptime_display="${uptime_hours}h ${uptime_minutes}m"
+        else
+            uptime_display="${uptime_minutes}m"
+        fi
+        
+        # Evaluate uptime status
         if [[ "$uptime_days" -gt 90 ]]; then
-            FIX_SUGGESTIONS["long_uptime"]="System uptime very high: ${uptime_days} days. Consider rebooting for stability and security updates"
+            FIX_SUGGESTIONS["long_uptime"]="System uptime very high: ${uptime_days} days. Consider rebooting for:
+• Kernel updates and security patches
+• Memory leak prevention
+• System stability improvements
+Reboot command: sudo shutdown -r now"
             log_result "WARN" "Security" "$test_name" "System uptime very high: ${uptime_days} days"
-            print_test_result "WARN" "$test_name" "${uptime_days} days uptime" "Consider rebooting for security updates" "long_uptime"
+            print_test_result "WARN" "$test_name" "${uptime_display} (Very High)" "Consider rebooting for security updates" "long_uptime"
         elif [[ "$uptime_days" -gt 30 ]]; then
+            FIX_SUGGESTIONS["medium_uptime"]="System uptime high: ${uptime_days} days. Recommended actions:
+• Schedule a maintenance window for reboot
+• Check for pending kernel updates
+• Review system logs for any issues"
             log_result "WARN" "Security" "$test_name" "System uptime high: ${uptime_days} days"
-            print_test_result "WARN" "$test_name" "${uptime_days} days uptime" "Reboot recommended for updates"
+            print_test_result "WARN" "$test_name" "${uptime_display} (High)" "Reboot recommended for updates" "medium_uptime"
         else
             log_result "PASS" "Security" "$test_name" "System uptime: ${uptime_days} days, ${uptime_hours} hours" "info"
-            print_test_result "PASS" "$test_name" "${uptime_days}d ${uptime_hours}h uptime" "Recent reboot or new system"
+            print_test_result "PASS" "$test_name" "${uptime_display}" "Recent reboot or new system"
         fi
+        
+        # Additional uptime insights
+        if [[ "$uptime_days" -gt 7 ]]; then
+            printf "    ${DIM}Last boot: %s${NC}\n" "$(date -d "now - $uptime_seconds seconds" '+%Y-%m-%d %H:%M:%S')"
+        fi
+    else
+        log_result "SKIP" "Security" "$test_name" "Uptime information unavailable"
+        print_test_result "SKIP" "$test_name" "Cannot read /proc/uptime" "System uptime data not accessible"
     fi
 }
 
+# Generate comprehensive summary report
 generate_summary_report() {
     local end_time health_score scan_duration
     end_time=$(date +%s)
     scan_duration=$((end_time - START_TIME))
     
-    print_section_header "COMPREHENSIVE DIAGNOSTIC REPORT" "Detailed analysis with actionable fixes"
+    print_section_header "COMPREHENSIVE SYSTEM HEALTH REPORT" "Detailed analysis with prioritized recommendations"
     
     if [[ $TOTAL_TESTS -gt 0 ]]; then
-        health_score=$(safe_calc "($PASSED_TESTS / $TOTAL_TESTS) * 100")
-        local status_color status_text
+        # Calculate health score with weighted components
+        health_score=$(safe_calc "(($PASSED_TESTS * 1.0 + $WARNING_TESTS * 0.5) / $TOTAL_TESTS) * 100")
         
-        if (( $(awk "BEGIN {print ($health_score >= 85)}") )); then
-            status_color="$GREEN" ; status_text="EXCELLENT"
-        elif (( $(awk "BEGIN {print ($health_score >= 70)}") )); then
-            status_color="$YELLOW" ; status_text="GOOD"
-        elif (( $(awk "BEGIN {print ($health_score >= 50)}") )); then
-            status_color="$YELLOW" ; status_text="FAIR"
-        else
-            status_color="$RED" ; status_text="POOR"
-        fi
-        
-        echo
-        printf "${BOLD}${PURPLE}╭─────────────────────────────────────────────────────────╮${NC}\n"
-        printf "${BOLD}${PURPLE}│${NC}                    ${BOLD}HEALTH SCORE: %s%%${NC}                     ${BOLD}${PURPLE}│${NC}\n" "$health_score"
-        printf "${BOLD}${PURPLE}│${NC}              ${status_color}${BOLD}STATUS: %s${NC}                      ${BOLD}${PURPLE}│${NC}\n" "$status_text"
-        printf "${BOLD}${PURPLE}╰─────────────────────────────────────────────────────────╯${NC}\n"
-        echo
-        
-        # Test statistics
-        printf "${BOLD}Test Results Summary:${NC}\n"
-        printf "  %s${GREEN}${CHECK} Passed:%s %d tests${NC}\n" "" "" "$PASSED_TESTS"
-        printf "  %s${YELLOW}${WARN} Warnings:%s %d tests${NC}\n" "" "" "$WARNING_TESTS"
-        printf "  %s${RED}${CROSS} Failed:%s %d tests${NC}\n" "" "" "$FAILED_TESTS"
-        printf "  %s${DIM}${INFO} Skipped:%s %d tests${NC}\n" "" "" "$SKIPPED_TESTS"
-        printf "  ${BOLD}Total Executed:%s %d tests in %ds${NC}\n" "" "$TOTAL_TESTS" "$scan_duration"
-        echo
-        
-        # Show critical issues
+        # Determine system status
+        local status_color status_text status_emoji
         if [[ ${#CRITICAL_ISSUES[@]} -gt 0 ]]; then
-            printf "${RED}${BOLD}CRITICAL ISSUES (Immediate Action Required):${NC}\n"
-            for issue in "${CRITICAL_ISSUES[@]}"; do
-                printf "  ${RED}${CROSS} %s${NC}\n" "$issue"
+            status_color="$RED"
+            status_text="CRITICAL"
+            status_emoji="🔴"
+        elif (( $(awk "BEGIN {print ($health_score >= 85)}") )); then
+            status_color="$GREEN"
+            status_text="EXCELLENT"
+            status_emoji="🟢"
+        elif (( $(awk "BEGIN {print ($health_score >= 70)}") )); then
+            status_color="$YELLOW"
+            status_text="GOOD"
+            status_emoji="🟡"
+        elif (( $(awk "BEGIN {print ($health_score >= 50)}") )); then
+            status_color="$YELLOW"
+            status_text="FAIR"
+            status_emoji="🟠"
+        else
+            status_color="$RED"
+            status_text="POOR"
+            status_emoji="🔴"
+        fi
+        
+        # Display health assessment
+        echo
+        printf "${BOLD}${PURPLE}╔═════════════════════════════════════════════════════════╗${NC}\n"
+        printf "${BOLD}${PURPLE}║${NC}                  ${BOLD}SYSTEM HEALTH ASSESSMENT${NC}                  ${BOLD}${PURPLE}║${NC}\n"
+        printf "${BOLD}${PURPLE}╠═════════════════════════════════════════════════════════╣${NC}\n"
+        printf "${BOLD}${PURPLE}║${NC}     ${status_color}${BOLD}%s Overall Status: %s${NC}     ${BOLD}${PURPLE}║${NC}\n" "$status_emoji" "$status_text"
+        printf "${BOLD}${PURPLE}║${NC}            ${BOLD}Health Score: ${status_color}%s%%${NC}            ${BOLD}${PURPLE}║${NC}\n" "$health_score"
+        printf "${BOLD}${PURPLE}╚═════════════════════════════════════════════════════════╝${NC}\n"
+        echo
+        
+        # Test statistics with visual indicators
+        printf "${BOLD}${BLUE}Test Execution Summary:${NC}\n"
+        printf "  ${GREEN}${CHECK} Passed:    %3d tests${NC}\n" "$PASSED_TESTS"
+        printf "  ${YELLOW}${WARN} Warnings:  %3d tests${NC}\n" "$WARNING_TESTS"
+        printf "  ${RED}${CROSS} Failed:    %3d tests${NC}\n" "$FAILED_TESTS"
+        printf "  ${DIM}${INFO} Skipped:   %3d tests${NC}\n" "$SKIPPED_TESTS"
+        printf "  ${BOLD}Total:      %3d tests executed in %d seconds${NC}\n" "$TOTAL_TESTS" "$scan_duration"
+        echo
+        
+        # Priority-based issue display
+        if [[ ${#CRITICAL_ISSUES[@]} -gt 0 ]]; then
+            printf "${RED}${BOLD}🚨 CRITICAL ISSUES (Immediate Attention Required):${NC}\n"
+            for i in "${!CRITICAL_ISSUES[@]}"; do
+                printf "  ${RED}%2d. %s${NC}\n" "$((i+1))" "${CRITICAL_ISSUES[$i]}"
             done
             echo
         fi
         
-        # Show high priority issues
         if [[ ${#HIGH_ISSUES[@]} -gt 0 ]]; then
-            printf "${YELLOW}${BOLD}HIGH PRIORITY ISSUES:${NC}\n"
-            for issue in "${HIGH_ISSUES[@]:0:5}"; do
-                printf "  ${YELLOW}${WARN} %s${NC}\n" "$issue"
+            printf "${YELLOW}${BOLD}⚠️  HIGH PRIORITY ISSUES:${NC}\n"
+            for i in "${!HIGH_ISSUES[@]}"; do
+                if [[ $i -lt 5 ]]; then
+                    printf "  ${YELLOW}%2d. %s${NC}\n" "$((i+1))" "${HIGH_ISSUES[$i]}"
+                fi
             done
-            [[ ${#HIGH_ISSUES[@]} -gt 5 ]] && printf "  ${DIM}... and %d more issues${NC}\n" $((${#HIGH_ISSUES[@]} - 5))
+            [[ ${#HIGH_ISSUES[@]} -gt 5 ]] && 
+                printf "  ${DIM}... and %d more high priority issues${NC}\n" $((${#HIGH_ISSUES[@]} - 5))
             echo
         fi
         
-        # Show detailed fix recommendations
+        # Actionable recommendations section
         if [[ ${#FIX_SUGGESTIONS[@]} -gt 0 ]]; then
-            echo
-            printf "${BOLD}${CYAN}╭─── DETAILED FIX RECOMMENDATIONS ───╮${NC}\n"
-            printf "${BOLD}${CYAN}│                                      │${NC}\n"
-            printf "${BOLD}${CYAN}╰──────────────────────────────────────╯${NC}\n"
-            echo
+            printf "${BOLD}${CYAN}🛠️  RECOMMENDED ACTIONS:${NC}\n"
+            printf "${CYAN}╭─────────────────────────────────────────────────────────╮${NC}\n"
             
             local fix_count=1
             for fix_key in "${!FIX_SUGGESTIONS[@]}"; do
-                printf "${BOLD}${CYAN}%d. %s:${NC}\n" "$fix_count" "${fix_key^^}"
-                printf "%s\n\n" "${FIX_SUGGESTIONS[$fix_key]}"
-                ((fix_count++))
-                [[ $fix_count -gt 10 ]] && break
+                # Prioritize critical fixes first
+                if [[ "$fix_key" == *"critical"* || "$fix_key" == *"failed"* ]]; then
+                    printf "${CYAN}│${NC} ${BOLD}%2d. ${RED}%s:${NC}\n" "$fix_count" "${fix_key^^}"
+                    printf "${CYAN}│${NC}   %s\n" "${FIX_SUGGESTIONS[$fix_key]}"
+                    printf "${CYAN}│${NC}\n"
+                    ((fix_count++))
+                fi
             done
+            
+            for fix_key in "${!FIX_SUGGESTIONS[@]}"; do
+                # Show other fixes after critical ones
+                if [[ ! "$fix_key" == *"critical"* && ! "$fix_key" == *"failed"* ]]; then
+                    printf "${CYAN}│${NC} ${BOLD}%2d. %s:${NC}\n" "$fix_count" "${fix_key^^}"
+                    printf "${CYAN}│${NC}   %s\n" "${FIX_SUGGESTIONS[$fix_key]}"
+                    printf "${CYAN}│${NC}\n"
+                    ((fix_count++))
+                fi
+                [[ $fix_count -gt 8 ]] && break
+            done
+            
+            printf "${CYAN}╰─────────────────────────────────────────────────────────╯${NC}\n"
+            echo
         fi
         
-        # Hardware-specific recommendations
+        # Hardware-specific recommendations with detection checks
         echo
-        printf "${BOLD}${PURPLE}HARDWARE-SPECIFIC RECOMMENDATIONS:${NC}\n"
+        printf "${BOLD}${PURPLE}🔧 HARDWARE-SPECIFIC RECOMMENDATIONS:${NC}\n"
         
-        if command_exists dmesg && dmesg 2>/dev/null | grep -qi bluetooth; then
-            printf "• ${CYAN}Bluetooth Hardware:${NC} Issues detected in system logs\n"
+        # Check for NVIDIA issues
+        if command_exists lspci && lspci 2>/dev/null | grep -qi "nvidia"; then
+            printf "• ${CYAN}NVIDIA Graphics:${NC}\n"
+            printf "  - Install proprietary driver: ${BOLD}sudo apt install nvidia-driver-535${NC}\n"
+            printf "  - Blacklist nouveau: ${BOLD}sudo bash -c 'echo \"blacklist nouveau\" > /etc/modprobe.d/blacklist-nouveau.conf'${NC}\n"
+            printf "  - Update initramfs: ${BOLD}sudo update-initramfs -u${NC}\n"
+            echo
+        fi
+        
+        # Check for Bluetooth issues
+        if command_exists lsusb && lsusb 2>/dev/null | grep -qi "bluetooth"; then
+            printf "• ${CYAN}Bluetooth Hardware:${NC}\n"
             printf "  - Install firmware: ${BOLD}sudo apt install bluez-firmware${NC}\n"
-            printf "  - Check hardware: ${BOLD}lsusb | grep -i bluetooth${NC}\n"
+            printf "  - Add kernel parameter: ${BOLD}btusb.enable_autosuspend=0${NC} to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub\n"
+            printf "  - Update GRUB: ${BOLD}sudo update-grub${NC}\n"
+            echo
         fi
         
-        if command_exists dmesg && dmesg 2>/dev/null | grep -qi "i2c_hid"; then
-            printf "• ${CYAN}Touchpad Hardware:${NC} I2C HID communication errors\n"
+        # Check for touchpad issues
+        if command_exists dmesg && dmesg 2>/dev/null | grep -qi "i2c_hid.*elan"; then
+            printf "• ${CYAN}ELAN Touchpad:${NC}\n"
             printf "  - Install drivers: ${BOLD}sudo apt install xserver-xorg-input-synaptics${NC}\n"
-            printf "  - Kernel parameter: ${BOLD}i2c_hid.use_polling_mode=1${NC} in GRUB\n"
+            printf "  - Add kernel parameter: ${BOLD}i2c_hid.use_polling_mode=1${NC} to GRUB_CMDLINE_LINUX_DEFAULT\n"
+            printf "  - Update GRUB: ${BOLD}sudo update-grub${NC}\n"
+            echo
         fi
         
-        if command_exists lspci && lspci 2>/dev/null | grep -qi "realtek\|broadcom\|intel.*wireless"; then
-            printf "• ${CYAN}Network Hardware:${NC} Common vendors detected\n"
-            printf "  - Update drivers: ${BOLD}sudo apt install firmware-realtek firmware-iwlwifi${NC}\n"
+        # Check for WiFi issues
+        if command_exists lspci && lspci 2>/dev/null | grep -qi "network"; then
+            printf "• ${CYAN}Network Hardware:${NC}\n"
+            printf "  - Update drivers: ${BOLD}sudo apt install firmware-iwlwifi firmware-realtek${NC}\n"
             printf "  - Check status: ${BOLD}sudo dmesg | grep -i firmware${NC}\n"
+            echo
         fi
     fi
     
+    # Maintenance checklist
     echo
-    printf "${BOLD}${GREEN}SYSTEM MAINTENANCE CHECKLIST:${NC}\n"
+    printf "${BOLD}${GREEN}📋 SYSTEM MAINTENANCE CHECKLIST:${NC}\n"
     printf "□ Run system updates: ${BOLD}sudo apt update && sudo apt upgrade${NC}\n"
     printf "□ Clean package cache: ${BOLD}sudo apt autoremove && sudo apt clean${NC}\n"
     printf "□ Check disk space: ${BOLD}df -h${NC}\n"
@@ -1255,16 +1438,19 @@ generate_summary_report() {
     printf "□ Update firmware: ${BOLD}sudo apt install firmware-linux firmware-linux-nonfree${NC}\n"
     printf "□ Restart failed services: ${BOLD}sudo systemctl restart [service]${NC}\n"
     
+    # Emergency commands
     echo
-    printf "${BOLD}${BLUE}EMERGENCY COMMANDS (if system is unstable):${NC}\n"
+    printf "${BOLD}${RED}🚨 EMERGENCY COMMANDS (if system is unstable):${NC}\n"
     printf "• Force filesystem check: ${BOLD}sudo fsck -f /dev/[device]${NC}\n"
     printf "• Emergency mode: ${BOLD}sudo systemctl rescue${NC}\n"
     printf "• Safe reboot: ${BOLD}sudo systemctl reboot${NC}\n"
     printf "• Check hardware errors: ${BOLD}sudo dmesg | grep -i error${NC}\n"
     
+    # Final summary
     echo
-    printf "${BOLD}${PURPLE}Diagnostic Complete - $(date '+%Y-%m-%d %H:%M:%S')${NC}\n"
-    printf "${DIM}Enhanced scan completed in %d seconds with root cause analysis${NC}\n" "$scan_duration"
+    printf "${BOLD}${PURPLE}📊 Diagnostic Complete - $(date '+%Y-%m-%d %H:%M:%S')${NC}\n"
+    printf "${DIM}Comprehensive system scan completed in %d seconds${NC}\n" "$scan_duration"
+    printf "${DIM}For additional help, consult: /var/log/syslog or journalctl -xe${NC}\n"
     echo
 }
 
@@ -1277,13 +1463,16 @@ main() {
     run_service_tests
     run_network_tests
     run_security_tests
+    run_uptime_analysis  # Replaced the inline uptime check with this function
     generate_summary_report
     
-    # Exit with appropriate code based on results
+    # Enhanced exit code handling
     if [[ ${#CRITICAL_ISSUES[@]} -gt 0 ]]; then
-        exit 2  # Critical issues found
+        exit 3  # Critical system issues
+    elif [[ $FAILED_TESTS -gt $PASSED_TESTS ]]; then
+        exit 2  # More failures than passes
     elif [[ ${#HIGH_ISSUES[@]} -gt 0 ]]; then
-        exit 1  # High priority issues found
+        exit 1  # High priority issues
     else
         exit 0  # System healthy
     fi
